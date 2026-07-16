@@ -5,6 +5,9 @@ __pycache__/
 .ipynb_checkpoints/
 .pytest_cache/
 
+# Local-only verification tests — not part of the shipped repo
+tests/
+
 # Virtual environments
 venv/
 env/
@@ -24,7 +27,17 @@ results/
 Figures/
 Figures_*/
 
-# New-run figure data and checkpoints (local, not shipped)
+# Allow the shipped checkpoints and figure_data. This negation block must come
+# BEFORE the more specific excludes below — gitignore uses last-match-wins, so
+# a broad "!checkpoints/**" appearing after "checkpoints/newrun_*.pt" would
+# silently re-include the very files that pattern means to exclude.
+!checkpoints/
+!checkpoints/**
+!figure_data/
+!figure_data/**
+
+# New-run figure data and checkpoints (local, not shipped) — must stay after
+# the allow-list negations above.
 figure_data_*/
 checkpoints/newrun_*.pt
 checkpoints/test_run.pt
@@ -34,9 +47,3 @@ checkpoints/test_run.pt
 *.swp
 .idea/
 .vscode/
-
-# Allow the shipped checkpoints and figure_data
-!checkpoints/
-!checkpoints/**
-!figure_data/
-!figure_data/**

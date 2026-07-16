@@ -41,16 +41,13 @@ Prediction: z_future ≈ zx + mean_delta          (greedy)
 
 Default: `hdim=64`, 3 hidden layers.
 
-### Prober
+### Probers
 
-A small MLP trained on top of frozen DYSIB latent codes to decode physical variables (angle θ, angular velocity ω, energies). Trained separately after DYSIB training is complete.
+Two prober architectures decode physical variables (angle θ, angular velocity ω, energies) from frozen DYSIB latent codes, trained separately after DYSIB training is complete. Both take `z` of shape `(batch, dz)` and output `(batch, output_dim)`.
 
-```
-Input:  z  (batch, dz)
-Output: predicted physical variable  (batch, output_dim)
-```
+**`RandomFeatureProber`** — the primary prober used for the final arXiv figures. A single fixed (untrained) random linear expansion (`expand_dim=512`, `weight_init="softplus_critical"`) followed by a `Softplus` nonlinearity, then a *trained* linear head. Because the expansion is frozen, the head is fit in closed form via ridge regression (`fit_ridge_head` in `training.py`, `alpha=1e-3`) instead of SGD — no epochs, no learning rate.
 
-Default: `hdim=1024`, 3 hidden layers.
+**`Prober`** — a configurable-depth MLP (`hdim`, `num_layers`, default `hdim=1024, num_layers=3`), trained with Adam via `train_prober`. This is the original prober architecture used in earlier revisions of this repo. The final figures also use a smaller instance of this same class (`hdim=128, num_layers=2`, "MLP-128×2") as a comparison prober in the sweep-vs-kz/N/nF figures, trained separately from the `RandomFeatureProber` and reported side by side (see `figure_data/sweep_metrics_mlp128x2.csv`).
 
 ---
 
@@ -94,20 +91,23 @@ The dataset is sourced from [Chen et al. 2022](https://zenodo.org/records/665385
 The split is fixed so that evaluation is always on held-out data. Passing `--samples_n > 1000` raises an error because it would overlap the test split.
 
 **Sliding window pairs** (`FrameDataset`):
-For a trajectory of length T with window size `num_frames`, there are `numD = T − 2·num_frames + 1` valid start positions. Each item is a pair (past_window, future_window) where the future window immediately follows the past window.
+For a trajectory of length T with window size `num_frames` and temporal offset `nF_stride`, there are `numD = T − nF_stride − num_frames + 1` valid start positions. Each item is a pair `(past_window, future_window)` where `future_window` starts `nF_stride` frames after `past_window` starts. `nF_stride` defaults to `1` (maximally overlapping windows), which is what produced the final arXiv figures; pass `nF_stride=num_frames` to recover the non-overlapping windowing used in earlier revisions of this repo.
 
 ---
 
 ## Checkpoint format
 
-Each `.pt` file is a plain Python dict saved with `torch.save`:
+Each `.pt` file is a plain Python dict saved with `torch.save`. Two variants exist:
+
+**Checkpoints saved by `training.py`'s CLI** (e.g. `checkpoints/my_run.pt` from the Quickstart):
 
 ```python
 {
     "state_dict": { ... },   # model weights (Encoder + DeltaDecoder)
     "params": {              # hyperparameters used during training
-        "kz":           int,    # latent dimension
+        "ndims":        int,    # latent dimension
         "num_frames":   int,
+        "nF_stride":    int,    # temporal offset between past/future windows
         "samples_n":    int,
         "rep":          int,    # random seed
         "dzf":          int,
@@ -126,15 +126,28 @@ Each `.pt` file is a plain Python dict saved with `torch.save`:
 }
 ```
 
+**The four shipped checkpoints** were instead extracted from the internal "PRX" HDF5 sweep that produced the final arXiv figures (see Provenance below), so they carry provenance fields instead of a per-checkpoint `history` (the full training curves live in the source sweep's HDF5 file, not duplicated here):
+
+```python
+{
+    "state_dict": { ... },
+    "params": { "ndims": ..., "num_frames": ..., "nF_stride": ..., "samples_n": ...,
+                "rep": ..., "dzf": ..., "hidden": ..., "decoder_hdim": ...,
+                "gamma": ..., "alpha": ..., "input_dim": ..., "epochs": ..., "batch_size": ... },
+    "run_name":  "dz2_numF2_str1_sN1000_rep3",   # run identity in the source sweep
+    "source_h5": "results_prx/results_kz.h5",    # which sweep file it was pulled from
+}
+```
+
 Load with:
 
 ```python
 import torch
-ck = torch.load("checkpoints/kz2_nF2_N1000_rep4.pt", weights_only=False)
+ck = torch.load("checkpoints/kz2_nF2_str1_N1000_rep3.pt", weights_only=False)
 model.load_state_dict(ck["state_dict"])
 ```
 
-The four shipped checkpoints were saved with an older training script and use `"ndims"` instead of `"kz"` as the latent dimension key. The `_load_checkpoint` helper in `precompute_figure_data.py` normalises this automatically.
+`precompute_figure_data.py`'s `_load_checkpoint` helper handles both variants transparently, and defaults `nF_stride` to `num_frames` (non-overlapping) for any checkpoint that predates the `nF_stride` key.
 
 ---
 
@@ -144,7 +157,9 @@ The four shipped checkpoints were saved with an older training script and use `"
 
 | File | Contents |
 |------|----------|
-| `sweep_metrics.csv` | Flat table of metrics across 571 hyperparameter runs: kz, num_frames, N, rep, final MI, prober RMSE for θ/ω/energy |
+| `sweep_metrics.csv` | Flat table of RF-ridge prober metrics across the hyperparameter sweep, de-duplicated across the kz/nF/N/kz8 sweep files on `(ndims, num_frames, nF_stride, samples_n, rep)`: kz, num_frames, nF_stride, N, rep, final MI, prober RMSE for θ/ω/energy. Row count is whatever the current sweep files produce — see the file itself rather than a hardcoded number here. |
+| `sweep_metrics_mlp128x2.csv` | Companion MLP-128×2 comparison prober metrics (θ/ω only, one `axis` per kz/nF/N/kz8 sweep) — paired with `sweep_metrics.csv` (via matching `ndims`/`num_frames`/`samples_n`/`rep`) to reproduce the "RF vs MLP compare" figures |
+| `prober_ablation.csv` | Prober architecture ablation: 4 RF-ridge variants (expand_dim/init/activation) + 5 MLP variants (hdim×num_layers), for kz=2 and kz=8, 10 reps each, at a fixed run (nF=2, N=1000, stride=1). Includes precomputed trainable-parameter counts so the notebook doesn't need torch. |
 | `phase_portrait.npz` | Latent codes + wrapped angle + angular velocity for kz=2 model |
 | `embedding_kz2.npz` | Subsampled (100k) latent codes + physical variables, for scatter plots |
 | `embedding_vs_N.npz` | Latent codes from kz=2 models trained with N=64, 256, 1000 |
@@ -152,7 +167,7 @@ The four shipped checkpoints were saved with an older training script and use `"
 | `pca_kz8.npz` | Singular values, participation ratio, TwoNN/MLE intrinsic dimensionality, PCA projection |
 | `cylindrical_phys.npz` | Wrapped angle (degrees) and angular velocity (degrees/s) for the cylindrical figure |
 
-`sweep_metrics.csv` is pre-aggregated from a 571-run sweep stored in legacy HDF5 files. It is not regeneratable from a single training run; it ships as-is and is read directly by the notebook.
+`sweep_metrics.csv`, `sweep_metrics_mlp128x2.csv`, and `prober_ablation.csv` are pre-aggregated from the internal "PRX" sweep HDF5 files (see Provenance below) via `task_sweep_metrics` / `task_sweep_metrics_mlp128x2` / `task_prober_ablation` in `precompute_figure_data.py`. They are not regeneratable without access to those sweep files; they ship as-is and are read directly by the notebook. `PRX_H5_DIR` / `PRX_MLP_H5_FILES` / `PROBER_ABLATION_H5` at the top of `precompute_figure_data.py` point at placeholder paths — set them to your own copy of the sweep files if you need to regenerate these CSVs.
 
 To use your own trained checkpoints with the precompute script, update the `CKPT_KZ2` / `CKPT_KZ8` / `CKPT_KZ2_N64` / `CKPT_KZ2_N256` paths at the top of `precompute_figure_data.py`. You can also run individual tasks:
 
@@ -173,22 +188,27 @@ Train a DYSIB model. Returns `(model, history_dict)`.
 - `x_test`, `y_test` are fixed test batches already on device, used for per-epoch MI evaluation
 - Includes gradient clipping (norm 1.0) and NaN detection
 
-### `encode_dataset(model, data, num_frames, device, batch_size)`
+### `encode_dataset(model, data, num_frames, nF_stride, device, batch_size)`
 
 Encode all sliding windows and return posterior means (not samples).
 
 - `data`: `(n_trials, T, D)` float tensor
+- `nF_stride` defaults to `1` (maximally overlapping windows)
 - Returns `(zx, numD)` where `zx` has shape `(n_trials × numD, dz)`, ordered by (trial, window) with trial as the slow index
 
-### `rollout_latent(model, zx, num_frames, numD, device, num_repeats, extra_steps)`
+### `rollout_latent(model, zx, num_frames, numD, nF_stride, device, num_repeats, extra_steps)`
 
-Roll out the learned latent dynamics from the first window of each trajectory.
+Roll out the learned latent dynamics from the first window of each trajectory. Each rollout step advances by `nF_stride` windows (defaults to `1`).
 
 - Returns a dict with greedy path, stochastic mean/std path, and latent-space RMSE curves
 
 ### `train_prober(prober, z_train, y_train, z_test, y_test, epochs, lr, batch_size, device)`
 
-Train a regression probe on frozen latent codes. Returns `(prober, train_mse, test_mse)`.
+Train a `Prober` (MLP) on frozen latent codes via Adam/SGD. Returns `(prober, train_mse, test_mse)`.
+
+### `fit_ridge_head(prober, zx_train, y_train, alpha, feat_batch, device)`
+
+Fit a `RandomFeatureProber`'s linear head via closed-form ridge regression (no epochs — a single pass accumulating the normal equations in float64 mini-batches). Modifies `prober.head` in place; the frozen `expand` layer is untouched. `alpha` defaults to `1e-3`.
 
 ---
 
@@ -200,6 +220,21 @@ The kz=8 analysis uses two estimators from the `skdim` package:
 - **MLE** (`sklearn.neighbors.NearestNeighbors`): Levina–Bickel maximum likelihood estimator. Computed across a range of k values to show stability.
 
 Both are run on a 10,000-point subsample of the full latent dataset.
+
+---
+
+## Provenance
+
+The four shipped checkpoints and every file in `figure_data/` were regenerated from the internal HDF5 sweep ("PRX") that produced the final revised figures on arXiv, replacing an earlier snapshot of this repository whose checkpoints and `sweep_metrics.csv` traced back to a pre-revision sweep. The prior version is preserved at the git tag `v1.0-arxiv-initial`.
+
+| Checkpoint | Source run | Source file |
+|---|---|---|
+| `kz2_nF2_str1_N1000_rep3.pt` | `dz2_numF2_str1_sN1000_rep3` | `results_prx/results_kz.h5` |
+| `kz8_nF2_str1_N1000_rep1.pt` | `dz8_numF2_str1_sN1000_rep1` | `results_prx/results_kz.h5` |
+| `kz2_nF2_str1_N64_rep3.pt` | `dz2_numF2_str1_sN64_rep3` | `results_prx/results_N.h5` |
+| `kz2_nF2_str1_N256_rep3.pt` | `dz2_numF2_str1_sN256_rep3` | `results_prx/results_N.h5` |
+
+All four use `nF_stride=1`, `gamma=0.01`, `epochs=300`, `batch_size=1024` — the same hyperparameters as the Quickstart defaults.
 
 ---
 

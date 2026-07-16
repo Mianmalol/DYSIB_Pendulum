@@ -4,6 +4,7 @@ Training and evaluation functions for DYSIB.
 Functions:
     train_dysib                  -- train a DYSIB model, return (model, history dict)
     train_prober                 -- train a Prober with MSE loss, return (prober, train_mse, test_mse)
+    fit_ridge_head               -- fit a RandomFeatureProber head via closed-form ridge regression
     predict_prober               -- run a trained prober in mini-batches
     wrapped_theta_rmse_deg_from_cos_sin
                                  -- wrapped angular RMSE from [cos(theta), sin(theta)] predictions
@@ -145,6 +146,64 @@ def train_prober(prober, z_train, y_train, z_test, y_test,
     return prober, tr_mse, ts_mse
 
 
+def fit_ridge_head(prober, zx_train, y_train, alpha=1e-3, feat_batch=4096, device="cuda"):
+    """
+    Fit the linear head of a RandomFeatureProber via closed-form ridge regression.
+
+    The frozen expansion weights are never touched. Normal equations are
+    accumulated in float64 mini-batches so the full feature matrix (N x d) is
+    never materialised. Bias is fitted without regularisation via centering:
+        W = (XtX_c + alpha*I)^-1 Xty_c
+        b = ybar - Xbar @ W
+
+    Updates prober.head.weight and prober.head.bias in-place.
+
+    Args:
+        prober    : RandomFeatureProber (expand layer frozen)
+        zx_train  : (N, dz) float CPU tensor — training latent codes
+        y_train   : (N, output_dim) float CPU tensor — training targets
+        alpha     : ridge regularisation coefficient (default 1e-3, matches arxiv config)
+        feat_batch: mini-batch size for accumulating XtX (default 4096)
+        device    : torch device string
+    """
+    prober.eval()
+    expand_dim = prober.expand.out_features
+    output_dim = prober.head.out_features
+
+    XtX   = torch.zeros(expand_dim, expand_dim, dtype=torch.float64, device=device)
+    Xty   = torch.zeros(expand_dim, output_dim, dtype=torch.float64, device=device)
+    X_sum = torch.zeros(expand_dim,             dtype=torch.float64, device=device)
+    y_sum = torch.zeros(output_dim,             dtype=torch.float64, device=device)
+    n     = 0
+
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(zx_train.to(device), y_train.to(device)),
+        batch_size=feat_batch, shuffle=False,
+    )
+
+    with torch.no_grad():
+        for z_b, y_b in loader:
+            feat   = prober.act(prober.expand(z_b)).double()
+            y_b    = y_b.double()
+            XtX   += feat.T @ feat
+            Xty   += feat.T @ y_b
+            X_sum += feat.sum(0)
+            y_sum += y_b.sum(0)
+            n     += feat.shape[0]
+
+    X_mean = X_sum / n
+    y_mean = y_sum / n
+    XtX_c  = XtX - n * torch.outer(X_mean, X_mean)
+    Xty_c  = Xty - n * torch.outer(X_mean, y_mean)
+
+    reg = alpha * torch.eye(expand_dim, dtype=torch.float64, device=device)
+    W   = torch.linalg.solve(XtX_c + reg, Xty_c)   # (expand_dim, output_dim)
+    b   = y_mean - X_mean @ W                        # (output_dim,)
+
+    prober.head.weight.data = W.T.float()
+    prober.head.bias.data   = b.float()
+
+
 def predict_prober(prober, z, batch_size=4096, device="cuda"):
     """
     Run a trained prober on latent codes in mini-batches.
@@ -187,7 +246,7 @@ def wrapped_theta_rmse_deg_from_cos_sin(pred_cos_sin, true_theta):
 # Encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
-def encode_dataset(model, data, num_frames, device="cuda", batch_size=4096):
+def encode_dataset(model, data, num_frames, nF_stride=1, device="cuda", batch_size=4096):
     """
     Encode all (trial, window) pairs from frame data through the DYSIB encoder.
     Returns the posterior MEAN (not a sample) for downstream probing / rollout.
@@ -195,17 +254,19 @@ def encode_dataset(model, data, num_frames, device="cuda", batch_size=4096):
     Args:
         model      : DYSIB instance
         data       : (n_trials, T, D) float tensor
-        num_frames : window size (numF)
+        num_frames : window length (numF)
+        nF_stride  : temporal offset between past and future window starts.
+                     Defaults to 1 (maximally overlapping, matches the published default).
         device     : torch device string
         batch_size : encoding mini-batch size
 
     Returns:
         zx   : (n_trials * numD, dz) CPU tensor  — mean latent codes, ordered
                by (trial, window) with trial as the slow index
-        numD : number of windows per trial = T - 2*num_frames + 1
+        numD : number of windows per trial = T - nF_stride - num_frames + 1
     """
-    numD    = data.shape[1] - 2 * num_frames + 1
-    dataset = FrameDataset(data, num_frames)
+    numD    = data.shape[1] - nF_stride - num_frames + 1
+    dataset = FrameDataset(data, num_frames, nF_stride=nF_stride)
     loader  = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     model.eval()
@@ -222,7 +283,7 @@ def encode_dataset(model, data, num_frames, device="cuda", batch_size=4096):
 # Latent rollout
 # ─────────────────────────────────────────────────────────────────────────────
 
-def rollout_latent(model, zx, num_frames, numD, device="cuda",
+def rollout_latent(model, zx, num_frames, numD, nF_stride=1, device="cuda",
                    num_repeats=40, extra_steps=0):
     """
     Roll out the latent dynamics decoder forward in time from the first window
@@ -234,8 +295,11 @@ def rollout_latent(model, zx, num_frames, numD, device="cuda",
     Args:
         model       : DYSIB (encoder + delta_decoder)
         zx          : (n_trials * numD, dz) CPU tensor — test-set latent codes
-        num_frames  : numF
+        num_frames  : numF — not used directly here; kept for call-site compatibility
         numD        : windows per trial
+        nF_stride   : temporal offset used during training/encoding. Each rollout step
+                      advances by nF_stride windows. Defaults to 1 (maximally overlapping,
+                      matches the published default).
         device      : torch device string
         num_repeats : stochastic samples per trajectory (for mean / std)
         extra_steps : prediction steps beyond the trajectory length
@@ -251,13 +315,13 @@ def rollout_latent(model, zx, num_frames, numD, device="cuda",
     model.eval()
     n_trials = zx.shape[0] // numD
     dz       = zx.shape[1]
-    n_steps  = numD // num_frames + extra_steps
+    n_steps  = numD // nF_stride + extra_steps
 
-    what_frames = np.arange(n_steps + 1) * num_frames
+    what_frames = np.arange(n_steps + 1) * nF_stride
 
-    # Ground truth: every num_frames-th window per trial (aligned to rollout steps)
-    truth = zx.reshape(n_trials, numD, dz)[:, ::num_frames, :].numpy()
-    # truth : (n_trials, n_truth_steps, dz)   where n_truth_steps = numD // num_frames + 1
+    # Ground truth: every nF_stride-th window per trial (aligned to rollout steps)
+    truth = zx.reshape(n_trials, numD, dz)[:, ::nF_stride, :].numpy()
+    # truth : (n_trials, n_truth_steps, dz)   where n_truth_steps = numD // nF_stride + 1
 
     # Starting latent code: first window of each test trajectory
     start = zx[::numD, :].to(device)   # (n_trials, dz)
@@ -316,7 +380,7 @@ def rollout_latent(model, zx, num_frames, numD, device="cuda",
 # Physical-variable RMS along a rollout
 # ─────────────────────────────────────────────────────────────────────────────
 
-def rollout_rms(prober, rollout, target_flat, numD, num_frames, device="cuda"):
+def rollout_rms(prober, rollout, target_flat, numD, num_frames, nF_stride=1, device="cuda"):
     """
     Decode a physical variable along a rollout and compute per-step RMS error.
 
@@ -326,7 +390,9 @@ def rollout_rms(prober, rollout, target_flat, numD, num_frames, device="cuda"):
         target_flat : (n_trials * numD,) CPU tensor of the physical variable,
                       ordered by (trial, window) — same ordering as latent codes
         numD        : windows per trial
-        num_frames  : numF (stride for aligning time indices)
+        num_frames  : numF (kept for call-site compatibility)
+        nF_stride   : temporal offset used during training/encoding (stride for aligning
+                      time indices). Defaults to 1 (maximally overlapping).
         device      : torch device string
 
     Returns:
@@ -338,8 +404,8 @@ def rollout_rms(prober, rollout, target_flat, numD, num_frames, device="cuda"):
     pred_mean   = rollout["pred_mean"]     # (n_steps+1, n_trials, dz)
     n_steps1, n_trials, dz = greedy_path.shape
 
-    # Align ground truth to rollout time steps (every num_frames-th window)
-    truth_2d  = target_flat.reshape(n_trials, numD)[:, ::num_frames].numpy()
+    # Align ground truth to rollout time steps (every nF_stride-th window)
+    truth_2d  = target_flat.reshape(n_trials, numD)[:, ::nF_stride].numpy()
     # truth_2d : (n_trials, n_truth_steps)
 
     n_compare = min(n_steps1, truth_2d.shape[1])
@@ -365,11 +431,16 @@ def rollout_rms(prober, rollout, target_flat, numD, num_frames, device="cuda"):
 
 
 def rollout_theta_rmse_wrapped(
-    prober, rollout, target_flat, numD, num_frames, batch_size=4096, device="cuda"
+    prober, rollout, target_flat, numD, num_frames, nF_stride=1,
+    batch_size=4096, device="cuda"
 ):
     """
     Decode theta along a rollout using a prober trained on [cos(theta), sin(theta)]
     targets, then compute wrapped angular RMSE in degrees per rollout step.
+
+    Args:
+        nF_stride : temporal offset used during training/encoding. Defaults to 1
+                    (maximally overlapping).
 
     Returns:
         rms_greedy : (n_compare,) ndarray — wrapped angular RMSE per step, greedy path
@@ -380,7 +451,7 @@ def rollout_theta_rmse_wrapped(
     pred_mean   = rollout["pred_mean"]     # (n_steps+1, n_trials, dz)
     n_steps1, n_trials, dz = greedy_path.shape
 
-    truth_theta = torch.as_tensor(target_flat).float().reshape(n_trials, numD)[:, ::num_frames]
+    truth_theta = torch.as_tensor(target_flat).float().reshape(n_trials, numD)[:, ::nF_stride]
     n_compare = min(n_steps1, truth_theta.shape[1])
     truth_theta = truth_theta[:, :n_compare].T  # (n_compare, n_trials)
 
@@ -419,6 +490,7 @@ def _run_training(
     samples_n=1000,
     ndims=2,
     num_frames=2,
+    nF_stride=1,
     rep=0,
     dzf=32,
     hidden=256,
@@ -434,6 +506,10 @@ def _run_training(
 
     The .npz is expected to have key 'frames' with shape (n_trials, T, D).
     The first `samples_n` trials are used for training; trials [1000:1200] for test.
+
+    nF_stride defaults to 1 (maximally overlapping windows), matching the pipeline
+    that produced the final arxiv figures. Pass --nF_stride equal to --num_frames
+    to recover the original non-overlapping windowing used in earlier revisions.
     """
     from pathlib import Path
 
@@ -456,11 +532,11 @@ def _run_training(
     train_data = frames[:samples_n]
     test_data  = frames[1000:1200]
 
-    train_ds = FrameDataset(train_data, num_frames)
+    train_ds = FrameDataset(train_data, num_frames, nF_stride=nF_stride)
     loader   = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
     # test batch: concatenate all (past, future) windows from test trials
-    test_ds = FrameDataset(test_data, num_frames)
+    test_ds = FrameDataset(test_data, num_frames, nF_stride=nF_stride)
     x_test = torch.stack([test_ds[i][0] for i in range(len(test_ds))]).to(device)
     y_test = torch.stack([test_ds[i][1] for i in range(len(test_ds))]).to(device)
 
@@ -474,7 +550,8 @@ def _run_training(
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     torch.save({
         "state_dict": model.state_dict(),
-        "params": dict(ndims=ndims, num_frames=num_frames, samples_n=samples_n, rep=rep,
+        "params": dict(ndims=ndims, num_frames=num_frames, nF_stride=nF_stride,
+                       samples_n=samples_n, rep=rep,
                        dzf=dzf, hidden=hidden, decoder_hdim=decoder_hdim,
                        gamma=gamma, alpha=alpha, input_dim=D),
         "history": hist,
@@ -493,6 +570,11 @@ if __name__ == "__main__":
     p.add_argument("--samples_n", type=int, default=1000)
     p.add_argument("--kz", type=int, default=2)
     p.add_argument("--num_frames", type=int, default=2)
+    p.add_argument("--nF_stride", type=int, default=1,
+                   help="Temporal offset between past/future window starts. "
+                        "Default 1 (maximally overlapping) matches the arxiv figures. "
+                        "Pass a value equal to --num_frames for the original "
+                        "non-overlapping windowing used in earlier revisions of this repo.")
     p.add_argument("--rep", type=int, default=0, help="Random seed / repetition index")
     p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -506,6 +588,7 @@ if __name__ == "__main__":
     _run_training(
         data_path=args.data, out_path=args.out,
         samples_n=args.samples_n, ndims=args.kz, num_frames=args.num_frames,
+        nF_stride=args.nF_stride,
         rep=args.rep, epochs=args.epochs, lr=args.lr, batch_size=args.batch_size,
         gamma=args.gamma, alpha=args.alpha, device=args.device,
     )
