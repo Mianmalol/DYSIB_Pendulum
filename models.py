@@ -4,13 +4,16 @@ Neural network architectures for DYSIB.
 DYSIB = Dynamical Symmetric Information Bottleneck.
 
 Classes:
-    Encoder        -- per-frame MLP VAE encoder
-    DeltaDecoder   -- predicts (mean_delta, logvar) for latent dynamics
-    DYSIB          -- full model: shared encoder + delta decoder + NCE MI estimator
-    Prober         -- small MLP to decode a physical variable from z (trained separately)
-    FrameDataset   -- sliding (past_window, future_window) pairs from trajectory data
-    ProbeDataset   -- (z, y) regression dataset for prober training
+    Encoder              -- per-frame MLP VAE encoder
+    DeltaDecoder         -- predicts (mean_delta, logvar) for latent dynamics
+    DYSIB                -- full model: shared encoder + delta decoder + NCE MI estimator
+    Prober               -- small MLP to decode a physical variable from z (trained separately)
+    RandomFeatureProber  -- random expansion + linear head probe (expansion weights frozen)
+    FrameDataset         -- sliding (past_window, future_window) pairs from trajectory data
+    ProbeDataset         -- (z, y) regression dataset for prober training
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -201,17 +204,19 @@ class Prober(nn.Module):
 
     Args:
         dz         : latent dimension (input size)
-        output_dim : 1 for scalar variables (theta, omega, energy)
-        hdim       : hidden layer width (3 hidden layers)
+        output_dim : 1 for scalar variables (theta, omega, energy); 2 for [cos,sin] theta
+        hdim       : hidden layer width
+        num_layers : number of hidden layers (default 3 preserves the original
+                     hard-coded architecture; the final arxiv figures' "128x2"
+                     comparison prober uses hdim=128, num_layers=2)
     """
-    def __init__(self, dz, output_dim=1, hdim=1024):
+    def __init__(self, dz, output_dim=1, hdim=1024, num_layers=3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(dz, hdim),    nn.ReLU(),
-            nn.Linear(hdim, hdim),  nn.ReLU(),
-            nn.Linear(hdim, hdim),  nn.ReLU(),
-            nn.Linear(hdim, output_dim),
-        )
+        layers = [nn.Linear(dz, hdim), nn.ReLU()]
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(hdim, hdim), nn.ReLU()]
+        layers.append(nn.Linear(hdim, output_dim))
+        self.net = nn.Sequential(*layers)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -222,24 +227,91 @@ class Prober(nn.Module):
         return self.net(z)
 
 
+class RandomFeatureProber(nn.Module):
+    """
+    Random-feature linear probe — the primary prober used to decode physical
+    variables in the final arxiv figures.
+
+    Projects z into a high-dimensional space with a single fixed (untrained)
+    linear layer followed by a nonlinearity, then trains only a linear head on
+    top. Because the expansion weights have requires_grad=False, the head can
+    be fit in closed form via ridge regression (see fit_ridge_head in
+    training.py) instead of iterative SGD.
+
+    Args:
+        dz         : latent dimension (input size)
+        output_dim : 1 for scalar targets; 2 for circular targets ([cos θ, sin θ])
+        expand_dim : random feature space size (default 512, matches the arxiv config)
+        activation : nn.Module applied after the random projection.
+                     Defaults to nn.Softplus().
+        weight_init: initialisation scheme for the frozen expansion weights.
+                     "he"                – Kaiming normal, std = sqrt(2/dz).
+                     "softplus_critical" – std = 2/sqrt(dz); matches the
+                                          variance-preservation condition for
+                                          softplus (arxiv default).
+                     "xavier"            – Glorot normal, std = sqrt(2/(dz+expand_dim)).
+                     callable            – called in-place as weight_init(weight_tensor).
+    """
+    def __init__(self, dz, output_dim=1, expand_dim=512,
+                 activation=None, weight_init="softplus_critical"):
+        super().__init__()
+
+        self.expand = nn.Linear(dz, expand_dim)
+        nn.init.zeros_(self.expand.bias)
+
+        if weight_init == "he":
+            nn.init.kaiming_normal_(self.expand.weight, nonlinearity="relu")
+        elif weight_init == "softplus_critical":
+            nn.init.normal_(self.expand.weight, std=2.0 / math.sqrt(dz))
+        elif weight_init == "xavier":
+            nn.init.xavier_normal_(self.expand.weight)
+        elif callable(weight_init):
+            weight_init(self.expand.weight)
+        else:
+            raise ValueError(f"Unknown weight_init: {weight_init!r}")
+
+        self.expand.requires_grad_(False)   # frozen — never updated by the optimizer
+
+        self.act  = nn.Softplus() if activation is None else activation
+        self.head = nn.Linear(expand_dim, output_dim)
+        nn.init.xavier_uniform_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, z):
+        return self.head(self.act(self.expand(z)))
+
+
 class FrameDataset(torch.utils.data.Dataset):
     """
     Sliding-window dataset over trajectory data.
 
-    Each item is a (past_window, future_window) pair of shape (num_frames, D).
-    For a trajectory of length T, there are numD = T - 2*num_frames + 1 valid
-    start positions (windows 0..numD-1 as past; numD..2*numD-1 as future).
+    Each item is a (past_window, future_window) pair of shape (num_frames, D):
+        past   = data[trial, t             : t + num_frames,              :]
+        future = data[trial, t + nF_stride  : t + nF_stride + num_frames,  :]
 
-    data       : (n_trials, T, D) float tensor
-    num_frames : window size
+    nF_stride controls the temporal offset between the start of the past window
+    and the start of the future window. The published default (nF_stride=1,
+    maximally overlapping windows) matches the pipeline that produced the final
+    arxiv figures. Pass nF_stride=num_frames to recover the original
+    non-overlapping windowing used in earlier revisions of this repo.
+
+    Args:
+        data       : (n_trials, T, D) float tensor
+        num_frames : window length (controls encoder architecture)
+        nF_stride  : temporal offset between past and future window starts.
+                     Defaults to 1 (maximally overlapping).
     """
-    def __init__(self, data, num_frames):
+    def __init__(self, data, num_frames, nF_stride=1):
         self.data       = data
         self.num_frames = num_frames
+        self.nF_stride  = nF_stride
         self.n_trials   = data.shape[0]
         self.T          = data.shape[1]
-        self.numD       = self.T - 2 * num_frames + 1
-        assert self.numD > 0, f"Not enough frames: T={self.T}, num_frames={num_frames}"
+        self.numD       = self.T - self.nF_stride - num_frames + 1
+        assert self.numD > 0, (
+            f"Not enough frames: T={self.T}, num_frames={num_frames}, "
+            f"nF_stride={self.nF_stride}"
+        )
 
     def __len__(self):
         return self.n_trials * self.numD
@@ -247,8 +319,8 @@ class FrameDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         trial = idx // self.numD
         t     = idx  % self.numD
-        past   = self.data[trial, t           : t + self.num_frames,           :]
-        future = self.data[trial, t + self.num_frames : t + 2 * self.num_frames, :]
+        past   = self.data[trial, t                  : t + self.num_frames,                  :]
+        future = self.data[trial, t + self.nF_stride  : t + self.nF_stride + self.num_frames, :]
         return past, future
 
 

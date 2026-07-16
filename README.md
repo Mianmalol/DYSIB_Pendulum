@@ -3,8 +3,12 @@
 Code and data for the paper:
 
 > **Information bottleneck for learning the phase space of dynamics from high-dimensional experimental data**
-> K. Michael Martini*, Eslam Abdelaleem*, Paarth Gulati, and Ilya Nemenman.
-> [**preprint**](https://doi.org/10.48550/arXiv.2604.24662)
+> K. Michael Martini\*, Eslam Abdelaleem\*, Paarth Gulati\*, and Ilya Nemenman. arXiv:2604.24662, 2026.
+> [arxiv.org/abs/2604.24662](https://arxiv.org/abs/2604.24662)
+>
+> \*Equal contribution.
+
+**Note:** this repository was recently updated to match the pipeline that produced the paper's final figures (it previously reflected an earlier, pre-revision snapshot). See [Provenance](#provenance) below for what changed, or the [`v1.0-arxiv-initial`](https://github.com/paarthgulati/DYSIB_Pendulum/releases/tag/v1.0-arxiv-initial) tag for the prior version.
 
 ---
 
@@ -62,7 +66,7 @@ This fetches the [Chen et al. (2022)](https://zenodo.org/records/6653856) pendul
 
 ```bash
 python training.py \
-    --kz 2 --num_frames 2 --samples_n 1000 \
+    --kz 2 --num_frames 2 --nF_stride 1 --samples_n 1000 \
     --rep 0 --epochs 300 \
     --out checkpoints/my_run.pt
 ```
@@ -73,6 +77,7 @@ Key options:
 |------|---------|--------------|
 | `--kz` | Latent dimension | 2 |
 | `--num_frames` | Frames per input window | 2 |
+| `--nF_stride` | Temporal offset between past/future window starts. 1 = maximally overlapping (used for the final paper figures); pass a value equal to `--num_frames` for non-overlapping windows | 1 |
 | `--samples_n` | Training trajectories (max 1000) | 1000 |
 | `--rep` | Random seed | varies |
 | `--epochs` | Training epochs | 300 |
@@ -87,7 +92,7 @@ Training prints mutual information (MI) and loss per epoch. On CPU, 300 epochs t
 python precompute_figure_data.py
 ```
 
-This loads the checkpoints in `checkpoints/`, encodes the dataset, trains linear probers, and writes the precomputed arrays consumed by the notebook to `figure_data/`. To use your own trained checkpoint instead of the shipped ones, update the `CKPT_KZ2` / `CKPT_KZ8` paths at the top of `precompute_figure_data.py`.
+This loads the checkpoints in `checkpoints/`, encodes the dataset, trains linear probers (a `RandomFeatureProber` fit by closed-form ridge regression — see [DETAILS.md](DETAILS.md)), and writes the precomputed arrays consumed by the notebook to `figure_data/`. To use your own trained checkpoint instead of the shipped ones, update the `CKPT_KZ2` / `CKPT_KZ8` / `CKPT_KZ2_N64` / `CKPT_KZ2_N256` paths at the top of `precompute_figure_data.py`.
 
 ### Step 4 — Plot the figures
 
@@ -107,16 +112,18 @@ DYSIB_Pendulum/
 ├── precompute_figure_data.py   Compute figure_data/ from checkpoints + data
 ├── reproduce_figures.ipynb     Generate all paper figures from figure_data/
 ├── requirements.txt
-├── LICENSE                     MIT
+├── LICENSE                     GPL-3.0
 │
 ├── checkpoints/                Trained model weights (shipped, ~4.5 MB total)
-│   ├── kz2_nF2_N1000_rep4.pt   Main embedding figures (kz=2, 1000 training trials)
-│   ├── kz8_nF2_N1000_rep21.pt  Intrinsic-dimensionality figure (kz=8)
-│   ├── kz2_nF2_N64_rep4.pt     
-│   └── kz2_nF2_N256_rep4.pt    Scalability comparison (N = 64, 256)
+│   ├── kz2_nF2_str1_N1000_rep3.pt   Main embedding figures (kz=2, 1000 training trials)
+│   ├── kz8_nF2_str1_N1000_rep1.pt   Intrinsic-dimensionality figure (kz=8)
+│   ├── kz2_nF2_str1_N64_rep3.pt
+│   └── kz2_nF2_str1_N256_rep3.pt    Scalability comparison (N = 64, 256)
 │
 ├── figure_data/                Precomputed arrays for the notebook (shipped, ~7 MB)
-│   ├── sweep_metrics.csv       Metrics from 571-run hyperparameter sweep
+│   ├── sweep_metrics.csv           RF-ridge prober metrics from the hyperparameter sweep
+│   ├── sweep_metrics_mlp128x2.csv  Companion MLP-128x2 prober metrics (theta/omega), for the "RF vs MLP compare" figures
+│   ├── prober_ablation.csv         Prober architecture ablation (4 RF-ridge + 5 MLP configs, kz=2 and kz=8)
 │   ├── phase_portrait.npz
 │   ├── embedding_kz2.npz
 │   ├── embedding_vs_N.npz
@@ -152,7 +159,8 @@ frames = torch.from_numpy(d["frames"])    # (1200, 60, 784)
 model = DYSIB(input_dim=784, dz=2)
 model, history = train_dysib(model, loader, x_test, y_test, epochs=300)
 
-# Encode the dataset and roll out latent dynamics
+# Encode the dataset and roll out latent dynamics (nF_stride defaults to 1,
+# maximally overlapping windows — matches the paper's final figures)
 zx, numD = encode_dataset(model, frames, num_frames=2)
 rollout   = rollout_latent(model, zx, num_frames=2, numD=numD)
 ```
@@ -167,11 +175,13 @@ If you use this code or the trained models, please cite:
 
 ```bibtex
 @article{martini2026dysib,
-  title   = {Information bottleneck for learning the phase space of dynamics from high-dimensional experimental data},
-  author  = {Martini, K. Michael and Abdelaleem, Eslam and Gulati, Paarth and Nemenman, Ilya},
-  journal = {arXiv preprint arXiv:2604.24662},
-  doi     = {https://doi.org/10.48550/arXiv.2604.24662},
-  year    = {2026},
+  title         = {Information bottleneck for learning the phase space of dynamics from high-dimensional experimental data},
+  author        = {Martini, K. Michael and Abdelaleem, Eslam and Gulati, Paarth and Nemenman, Ilya},
+  journal       = {arXiv preprint arXiv:2604.24662},
+  eprint        = {2604.24662},
+  archivePrefix = {arXiv},
+  year          = {2026},
+  note          = {K. M. Martini, E. Abdelaleem, and P. Gulati contributed equally to this work.},
 }
 ```
 
@@ -189,6 +199,19 @@ The raw video dataset is from:
 
 ---
 
+## Provenance
+
+The shipped checkpoints and `figure_data/` were regenerated from the internal
+sweep that produced the final revised figures on arXiv (`nF_stride=1`
+overlapping windows; `RandomFeatureProber` + closed-form ridge regression as
+the primary prober, compared against an MLP-128×2 prober in the sweep
+comparison figures — see [DETAILS.md](DETAILS.md)). The prior version of this
+repository (non-overlapping windows, MLP-only prober) is preserved at the git
+tag [`v1.0-arxiv-initial`](https://github.com/paarthgulati/DYSIB_Pendulum/releases/tag/v1.0-arxiv-initial)
+for anyone who needs to reproduce the original numbers.
+
+---
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GPL-3.0 — see [LICENSE](LICENSE). (Earlier versions of this repository, including the `v1.0-arxiv-initial` tag, were released under MIT; that license still applies to the code as it existed at that point.)

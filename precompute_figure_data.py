@@ -14,7 +14,11 @@ Usage:
 
 Outputs
 -------
-figure_data/sweep_metrics.csv       Flat table of (kz, nF, N, rep, test/train metrics).
+figure_data/sweep_metrics.csv       Flat table of (kz, nF, N, rep, test/train metrics), RF-ridge prober.
+figure_data/sweep_metrics_mlp128x2.csv  Companion MLP-128x2 prober metrics (theta/omega only),
+                                     for the "RF vs MLP compare" figures.
+figure_data/prober_ablation.csv     Prober architecture ablation (4 RF-ridge + 5 MLP configs,
+                                     kz=2 and kz=8, 10 reps), incl. precomputed trainable-param counts.
 figure_data/phase_portrait.npz      theta_wrapped, omega, latent Z for kz=2 run.
 figure_data/embedding_kz2.npz       Subsampled Z + physical vars for kz=2 embedding scatter.
 figure_data/embedding_vs_N.npz      Z + theta for N ∈ {64, 256, 1000}.
@@ -32,40 +36,82 @@ import numpy as np
 import torch
 
 import data as data_mod
-from models import DYSIB, Prober
+from models import DYSIB, Prober, RandomFeatureProber
 from training import (
     encode_dataset,
+    fit_ridge_head,
     predict_prober,
     train_prober,
 )
+
+# Prober config for the primary (RF-ridge) prober — matches the sweep that
+# produced the final arxiv figures.
+RF_EXPAND_DIM   = 512
+RF_WEIGHT_INIT  = "softplus_critical"
+RF_RIDGE_ALPHA  = 1e-3
 
 # ─── config ─────────────────────────────────────────────────────────────────
 CKPT_DIR    = Path("checkpoints")
 FIGDATA_DIR = Path("figure_data")
 
-# Runs that have shipped checkpoints (figures that visualize embeddings)
-CKPT_KZ2          = CKPT_DIR / "kz2_nF2_N1000_rep4.pt"
-CKPT_KZ8          = CKPT_DIR / "kz8_nF2_N1000_rep21.pt"
-CKPT_KZ2_N64      = CKPT_DIR / "kz2_nF2_N64_rep4.pt"
-CKPT_KZ2_N256     = CKPT_DIR / "kz2_nF2_N256_rep4.pt"
+# Runs that have shipped checkpoints (figures that visualize embeddings).
+# All four are sourced from the "PRX" sweep (nF_stride=1) that produced the
+# final arxiv figures — see DETAILS.md "Provenance" section.
+CKPT_KZ2          = CKPT_DIR / "kz2_nF2_str1_N1000_rep3.pt"
+CKPT_KZ8          = CKPT_DIR / "kz8_nF2_str1_N1000_rep1.pt"
+CKPT_KZ2_N64      = CKPT_DIR / "kz2_nF2_str1_N64_rep3.pt"
+CKPT_KZ2_N256     = CKPT_DIR / "kz2_nF2_str1_N256_rep3.pt"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Source H5 files for sweep metrics — consulted ONCE, producing sweep_metrics.csv.
-# Users cloning the repo read the shipped .csv; this path is only relevant if you
-# want to re-aggregate your own sweep from legacy HDF5 files.
+# Source H5 files for sweep metrics — consulted ONCE, producing sweep_metrics.csv
+# and sweep_metrics_mlp128x2.csv. Users cloning the repo read the shipped .csv
+# files; these paths are only relevant if you want to re-aggregate your own
+# sweep from the internal "PRX" HDF5 sweep files (nF_stride=1, RF-ridge +
+# MLP-128x2 probers) that produced the final arxiv figures.
 # Set to your own directory of sweep .h5 files if needed.
-OLD_H5_DIR = Path("/path/to/your/sweep_h5_files")
+PRX_H5_DIR = Path("/path/to/your/results_prx")   # expects results_{kz,nf,N,N_kz8,nf_stride_nf}.h5
+
+# The MLP-128x2 comparison prober is stored in a separate companion file per
+# sweep axis (not one uniform directory) — traced directly from the notebook
+# that produced the final figures (paper_figures_prx_compare.ipynb, cell 2).
+PRX_MLP_H5_FILES = {
+    "kz":  PRX_H5_DIR / "prober_mlp" / "probers_kz.h5",
+    "nf":  PRX_H5_DIR / "prober_mlp" / "probers_nf.h5",
+    "N":   PRX_H5_DIR / "prober_mlp_ep100" / "probers_N.h5",       # 100 epochs, sufficient for kz<=8
+    "kz8": PRX_H5_DIR / "prober_mlp_kz8_ep200" / "probers_N.h5",   # 200 epochs — kz=8 needed longer to converge
+}
+
+# Prober architecture ablation (broader than the two probers used elsewhere):
+# 4 RF-ridge variants (expand_dim/init/activation) + 5 MLP variants (hdim x
+# num_layers), each evaluated at a fixed run (nF=2, N=1000, stride=1) for both
+# kz=2 and kz=8. Source: paper_figures_prx_compare.ipynb cell 47.
+PROBER_ABLATION_H5 = {
+    2: {
+        "ridge": PRX_H5_DIR / "prober_ablation" / "kz2" / "probers_kz_ridge.h5",
+        "mlp":   PRX_H5_DIR / "prober_ablation" / "kz2" / "probers_kz.h5",
+    },
+    8: {
+        "ridge": PRX_H5_DIR / "prober_ablation" / "kz8" / "probers_kz_ridge.h5",
+        "mlp":   PRX_H5_DIR / "prober_ablation" / "kz8" / "probers_kz.h5",
+    },
+}
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 def _load_checkpoint(path):
     ck = torch.load(path, map_location=DEVICE, weights_only=False)
-    p  = ck["params"]
-    # Compat patch (now inactive): training.py previously saved this key as "kz".
-    # Inconsistency resolved — training.py now uniformly saves "ndims" everywhere.
-    # if "kz" in p and "ndims" not in p:
-    #     p = dict(p, ndims=p["kz"])
+    p  = dict(ck["params"])
+    # Older checkpoints (pre-PRX) predate nF_stride and were trained with
+    # non-overlapping windows (nF_stride == num_frames), not the published
+    # default of 1 used going forward.
+    p.setdefault("nF_stride", p["num_frames"])
+    # Provenance fields (run_name / source_h5) live alongside "params" in the
+    # checkpoint dict, not inside it — fold them in here so callers have one
+    # place to look. Falls back to the filename for checkpoints saved before
+    # this provenance convention existed.
+    p.setdefault("run_name", ck.get("run_name", path.stem))
+    p.setdefault("source_h5", ck.get("source_h5"))
     model = DYSIB(
         input_dim    = int(p["input_dim"]),
         dz           = int(p["ndims"]),
@@ -81,14 +127,14 @@ def _load_checkpoint(path):
     return model, p
 
 
-def _fvars_flat(phys_arrays, num_frames):
+def _fvars_flat(phys_arrays, num_frames, nF_stride=1):
     """Flatten physical variables to match (trial, window) ordering from FrameDataset.
 
-    Each trial contributes numD = T - 2*num_frames + 1 windows, indexed by the
-    FIRST past-window frame, which is at global frame index 0..numD-1.
+    Each trial contributes numD = T - nF_stride - num_frames + 1 windows, indexed by
+    the FIRST past-window frame, which is at global frame index 0..numD-1.
     """
     T = phys_arrays["theta"].shape[1]
-    numD = T - 2 * num_frames + 1
+    numD = T - nF_stride - num_frames + 1
     def _flat(a):
         return a[:, :numD].reshape(-1).astype(np.float32)
     return {
@@ -108,15 +154,19 @@ def _wrap_deg(theta_rad):
 
 # ─── tasks ──────────────────────────────────────────────────────────────────
 def task_sweep_metrics(out, force=False):
-    """Flatten per-run metrics across all H5 sweep files into one CSV.
+    """Flatten per-run RF-ridge prober metrics across all PRX H5 sweep files into one CSV.
 
     Each H5 run stores:
       runs/<run_name>/
-        .attrs             : ndims, num_frames, samples_n, rep, gamma, epochs, batch_size
+        .attrs             : ndims, num_frames, nF_stride, samples_n, rep,
+                             gamma, epochs, batch_size, prober_type, prober_config
         probers/.attrs     : theta_{train,test}_deg, omega_{train,test}_rmse,
-                             kinetic_{...}, pot_{...}
+                             kinetic_{...}, pot_{...}   (RF-ridge prober)
         training/test_mi   : (epochs,) float32  — take the last value as final MI
         training/train_mi  : (epochs,) float32
+
+    See sweep_metrics_mlp128x2.csv (task_sweep_metrics_mlp128x2) for the
+    companion MLP-128x2 prober used in the "RF vs MLP compare" figures.
     """
     if out.exists() and not force:
         print(f"  [skip] {out}")
@@ -127,7 +177,7 @@ def task_sweep_metrics(out, force=False):
     except ImportError as e:
         raise ImportError(f"h5py + pandas required for sweep_metrics: {e}")
 
-    param_keys  = ["ndims", "num_frames", "samples_n", "rep",
+    param_keys  = ["ndims", "num_frames", "nF_stride", "samples_n", "rep",
                    "gamma", "epochs", "batch_size"]
     prober_keys = ["theta_test_deg", "theta_train_deg",
                    "omega_test_rmse", "omega_train_rmse",
@@ -135,14 +185,15 @@ def task_sweep_metrics(out, force=False):
                    "pot_test_rmse", "pot_train_rmse"]
 
     rows = []
-    for h5 in sorted(OLD_H5_DIR.glob("*.h5")):
+    for h5 in sorted(PRX_H5_DIR.glob("*.h5")):
         try:
             with h5py.File(h5, "r") as f:
                 runs = f.get("runs")
                 if runs is None:
                     continue
                 for run_name, grp in runs.items():
-                    row = {"run_name": run_name, "source_h5": h5.name}
+                    row = {"run_name": run_name, "source_h5": h5.name,
+                           "prober_type": "rf_ridge"}
                     for k in param_keys:
                         if k in grp.attrs:
                             row[k] = grp.attrs[k]
@@ -161,12 +212,133 @@ def task_sweep_metrics(out, force=False):
 
     df = pd.DataFrame(rows)
     # De-duplicate (same run appearing in multiple H5 files) — keep first.
-    if {"ndims", "num_frames", "samples_n", "rep"}.issubset(df.columns):
-        df = df.drop_duplicates(subset=["ndims", "num_frames", "samples_n", "rep"],
-                                keep="first").reset_index(drop=True)
+    # nF_stride MUST be part of the key: a stride=1 run and a stride=num_frames
+    # run can otherwise share identical (ndims, num_frames, samples_n, rep) —
+    # e.g. results_nf.h5 (stride=1) vs results_nf_stride_nf.h5 (stride=num_frames) —
+    # and are genuinely different runs, not duplicates of each other.
+    dedup_keys = ["ndims", "num_frames", "nF_stride", "samples_n", "rep"]
+    if set(dedup_keys).issubset(df.columns):
+        df = df.drop_duplicates(subset=dedup_keys, keep="first").reset_index(drop=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out, index=False)
     print(f"  → {out}  ({len(df)} unique runs)")
+
+
+def task_sweep_metrics_mlp128x2(out, force=False):
+    """Flatten per-run MLP-128x2 comparison prober metrics into a companion CSV.
+
+    Sourced from PRX_MLP_H5_FILES — a separate companion file per sweep axis
+    (kz, nf, N, kz8), each storing theta/omega-only metrics (no kinetic/pot)
+    under runs/<run_name>/probers/128x2/{theta,omega}.attrs. Used together with
+    sweep_metrics.csv (prober_type='rf_ridge') to reproduce the "RF vs MLP
+    compare" figures.
+    """
+    if out.exists() and not force:
+        print(f"  [skip] {out}")
+        return
+    try:
+        import h5py
+        import pandas as pd
+    except ImportError as e:
+        raise ImportError(f"h5py + pandas required for sweep_metrics_mlp128x2: {e}")
+
+    param_keys = ["ndims", "num_frames", "nF_stride", "samples_n", "rep",
+                  "gamma", "epochs", "batch_size"]
+
+    rows = []
+    for axis, h5 in PRX_MLP_H5_FILES.items():
+        if not h5.exists():
+            print(f"  [skip] {axis}: {h5} not found")
+            continue
+        with h5py.File(h5, "r") as f:
+            runs = f.get("runs")
+            if runs is None:
+                continue
+            for run_name, grp in runs.items():
+                # parent/name (not the full path): keeps provenance unambiguous —
+                # two axes share the basename probers_N.h5 — without leaking
+                # internal absolute paths into the shipped CSV.
+                row = {"run_name": run_name,
+                       "source_h5": f"{h5.parent.name}/{h5.name}", "axis": axis,
+                       "prober_type": "mlp_128x2"}
+                for k in param_keys:
+                    if k in grp.attrs:
+                        row[k] = grp.attrs[k]
+                pgrp = grp.get("probers/128x2")
+                if pgrp is not None:
+                    if "theta" in pgrp and "theta_test_deg" in pgrp["theta"].attrs:
+                        row["theta_test_deg"] = float(pgrp["theta"].attrs["theta_test_deg"])
+                    if "omega" in pgrp and "omega_test_rmse" in pgrp["omega"].attrs:
+                        row["omega_test_rmse"] = float(pgrp["omega"].attrs["omega_test_rmse"])
+                rows.append(row)
+
+    df = pd.DataFrame(rows)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"  → {out}  ({len(df)} rows across {len(PRX_MLP_H5_FILES)} axes)")
+
+
+def _ablation_trainable_params(cfg_key, dz, output_dim=2):
+    """Trainable parameter count for one ablation prober config.
+
+    RF-ridge: only the linear head is fit (ridge regression) — the random
+    expansion is frozen, so trainable = output_dim * expand_dim + output_dim.
+    MLP: every parameter is trained with Adam — instantiate and count.
+    Computed once here (not in the notebook) so reproduce_figures.ipynb never
+    needs torch.
+    """
+    if cfg_key.startswith("rf_"):
+        expand_dim = int(cfg_key.split("_")[1])
+        return output_dim * expand_dim + output_dim
+    hdim, num_layers = (int(x) for x in cfg_key.split("x"))
+    m = Prober(dz=dz, output_dim=output_dim, hdim=hdim, num_layers=num_layers)
+    return sum(p.numel() for p in m.parameters())
+
+
+def task_prober_ablation(out, force=False):
+    """Flatten the prober architecture ablation (4 RF-ridge + 5 MLP configs,
+    kz=2 and kz=8, 10 reps each, fixed nF=2/N=1000/stride=1 run) into one CSV.
+
+    Trainable-parameter counts are precomputed here (needs torch/Prober) so the
+    notebook itself can stay torch-free.
+    """
+    if out.exists() and not force:
+        print(f"  [skip] {out}")
+        return
+    try:
+        import h5py
+        import pandas as pd
+    except ImportError as e:
+        raise ImportError(f"h5py + pandas required for prober_ablation: {e}")
+
+    rows = []
+    for kz, h5_paths in PROBER_ABLATION_H5.items():
+        for prober_kind, h5_path in h5_paths.items():
+            if not h5_path.exists():
+                print(f"  [skip] kz={kz} {prober_kind}: {h5_path} not found")
+                continue
+            with h5py.File(h5_path, "r") as f:
+                for run_name, run_grp in f.get("runs", {}).items():
+                    rep = int(run_grp.attrs.get("rep", 0))
+                    for cfg_key, cfg_grp in run_grp.get("probers", {}).items():
+                        label = str(cfg_grp.attrs.get("prober_label", cfg_key)).replace(" [ridge]", "")
+                        theta_v = omega_v = None
+                        if "theta" in cfg_grp and "theta_test_deg" in cfg_grp["theta"].attrs:
+                            theta_v = float(cfg_grp["theta"].attrs["theta_test_deg"])
+                        if "omega" in cfg_grp and "omega_test_rmse" in cfg_grp["omega"].attrs:
+                            omega_v = float(cfg_grp["omega"].attrs["omega_test_rmse"]) * (180.0 / np.pi)
+                        rows.append({
+                            "kz": kz, "rep": rep, "cfg_key": cfg_key, "prober_label": label,
+                            "prober_kind": "RF-linear" if cfg_key.startswith("rf_") else "MLP",
+                            "theta_test_deg": theta_v, "omega_test_deg_s": omega_v,
+                            "trainable_params_theta": _ablation_trainable_params(cfg_key, dz=kz, output_dim=2),
+                            "trainable_params_omega": _ablation_trainable_params(cfg_key, dz=kz, output_dim=1),
+                        })
+
+    df = pd.DataFrame(rows)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"  → {out}  ({len(df)} rows)")
 
 
 def task_phase_portrait(out, data_npz, force=False):
@@ -176,7 +348,8 @@ def task_phase_portrait(out, data_npz, force=False):
         return
     model, p = _load_checkpoint(CKPT_KZ2)
     frames = torch.from_numpy(data_npz["frames"]).float()
-    zx, numD = encode_dataset(model, frames, int(p["num_frames"]), device=DEVICE)
+    zx, numD = encode_dataset(model, frames, int(p["num_frames"]),
+                              nF_stride=int(p["nF_stride"]), device=DEVICE)
     zx_by_trial = zx.numpy().reshape(frames.shape[0], numD, int(p["ndims"]))
 
     theta_rad = data_npz["theta"]           # (1200, 60)
@@ -188,7 +361,7 @@ def task_phase_portrait(out, data_npz, force=False):
         theta_wrapped_deg = theta_wrapped_deg.astype(np.float32),
         omega_rad_per_s   = omega.astype(np.float32),
         zx_latent         = zx_by_trial.astype(np.float32),   # (1200, numD, 2)
-        run_name          = np.array("kz2_nF2_N1000_rep4"),
+        run_name          = np.array(p["run_name"]),
     )
     print(f"  → {out}  zx shape={zx_by_trial.shape}")
 
@@ -200,7 +373,8 @@ def task_embedding_kz2(out, data_npz, force=False, subsample=100_000, seed=0):
         return
     model, p = _load_checkpoint(CKPT_KZ2)
     frames = torch.from_numpy(data_npz["frames"]).float()
-    zx, numD = encode_dataset(model, frames, int(p["num_frames"]), device=DEVICE)
+    zx, numD = encode_dataset(model, frames, int(p["num_frames"]),
+                              nF_stride=int(p["nF_stride"]), device=DEVICE)
     zx_np = zx.numpy()
 
     phys_dict = {
@@ -210,7 +384,7 @@ def task_embedding_kz2(out, data_npz, force=False, subsample=100_000, seed=0):
         "potential_energy": data_npz["potential_energy"],
         "total_energy":     data_npz["total_energy"],
     }
-    fv, _ = _fvars_flat(phys_dict, int(p["num_frames"]))
+    fv, _ = _fvars_flat(phys_dict, int(p["num_frames"]), nF_stride=int(p["nF_stride"]))
 
     rng = np.random.default_rng(seed)
     N = zx_np.shape[0]
@@ -244,9 +418,10 @@ def task_embedding_vs_N(out, data_npz, force=False, subsample=50_000, seed=0):
     out_d = {}
     for N_train, ck_path in ckpts.items():
         model, p = _load_checkpoint(ck_path)
-        zx, numD = encode_dataset(model, frames, int(p["num_frames"]), device=DEVICE)
+        zx, numD = encode_dataset(model, frames, int(p["num_frames"]),
+                                  nF_stride=int(p["nF_stride"]), device=DEVICE)
         zx_np = zx.numpy()
-        fv, _ = _fvars_flat(phys_dict, int(p["num_frames"]))
+        fv, _ = _fvars_flat(phys_dict, int(p["num_frames"]), nF_stride=int(p["nF_stride"]))
 
         rng = np.random.default_rng(seed)
         idx = rng.choice(zx_np.shape[0],
@@ -258,18 +433,25 @@ def task_embedding_vs_N(out, data_npz, force=False, subsample=50_000, seed=0):
     print(f"  → {out}  N ∈ {{64, 256, 1000}}")
 
 
-def task_rollout_test(out, data_npz, force=False,
+def task_rollout_test(out, data_npz, force=False, prober_type="rf_ridge",
                       num_samples=40, quiver_n=30, n_vis=3, vis_seed=3):
-    """Roll out kz=2 dynamics on the 200-trial test set; compute RMSE + quiver."""
+    """Roll out kz=2 dynamics on the 200-trial test set; compute RMSE + quiver.
+
+    prober_type : "rf_ridge" (default) fits a RandomFeatureProber via closed-form
+                  ridge regression, matching the pipeline that produced the final
+                  arxiv figures. "mlp" reproduces the original 1024x3 MLP+Adam
+                  prober used by earlier revisions of this repo.
+    """
     if out.exists() and not force:
         print(f"  [skip] {out}")
         return
     model, p = _load_checkpoint(CKPT_KZ2)
     nf = int(p["num_frames"])
     dz = int(p["ndims"])
+    nf_stride = int(p["nF_stride"])
 
     frames = torch.from_numpy(data_npz["frames"]).float()
-    zx, numD = encode_dataset(model, frames, nf, device=DEVICE)
+    zx, numD = encode_dataset(model, frames, nf, nF_stride=nf_stride, device=DEVICE)
     zx_np = zx.numpy()
 
     # ── train θ prober on cos/sin targets (for wrapped RMSE decoding) ──────
@@ -290,21 +472,33 @@ def task_rollout_test(out, data_npz, force=False,
         [torch.cos(theta_flat[test_slice]),  torch.sin(theta_flat[test_slice])],  dim=1
     )
 
-    p_theta = Prober(dz=dz, output_dim=2).to(DEVICE)
-    p_theta, _, _ = train_prober(
-        p_theta,
-        zx[train_slice], theta_tr_xy,
-        zx[test_slice],  theta_ts_xy,
-        epochs=100, lr=1e-4, batch_size=1024, device=DEVICE,
-    )
+    if prober_type == "rf_ridge":
+        p_theta = RandomFeatureProber(
+            dz=dz, output_dim=2, expand_dim=RF_EXPAND_DIM, weight_init=RF_WEIGHT_INIT,
+        ).to(DEVICE)
+        fit_ridge_head(p_theta, zx[train_slice], theta_tr_xy,
+                       alpha=RF_RIDGE_ALPHA, device=DEVICE)
+    elif prober_type == "mlp":
+        p_theta = Prober(dz=dz, output_dim=2).to(DEVICE)
+        p_theta, _, _ = train_prober(
+            p_theta,
+            zx[train_slice], theta_tr_xy,
+            zx[test_slice],  theta_ts_xy,
+            epochs=100, lr=1e-4, batch_size=1024, device=DEVICE,
+        )
+    else:
+        raise ValueError(f"Unknown prober_type: {prober_type!r}")
 
     # ── rollout on test set ────────────────────────────────────────────────
     N_TEST    = 200
     zx_test   = zx.reshape(1200, numD, dz)[N_train_trials:N_train_trials + N_TEST].clone()
     theta_tst = theta_flat[test_slice].reshape(N_TEST, numD)
 
-    n_rollout = numD // nf
-    x_frames  = np.arange(n_rollout + 1) * nf
+    # (numD - 1) rather than numD: guarantees n_rollout * nf_stride stays a valid
+    # index into the numD encoded windows. With nf_stride=1, numD // nf_stride
+    # divides exactly and would request one step past the last window.
+    n_rollout = (numD - 1) // nf_stride
+    x_frames  = np.arange(n_rollout + 1) * nf_stride
 
     # particles (stochastic rollout)
     pred_z = torch.zeros(n_rollout + 1, N_TEST, dz)
@@ -318,7 +512,7 @@ def task_rollout_test(out, data_npz, force=False,
             pred_z[s + 1] = particles.mean(dim=1)
 
     true_z_visited = torch.stack(
-        [zx_test[:, k * nf, :] for k in range(n_rollout + 1)], dim=0
+        [zx_test[:, k * nf_stride, :] for k in range(n_rollout + 1)], dim=0
     )  # (n_rollout+1, N_TEST, dz)
 
     # Latent RMSE
@@ -331,7 +525,7 @@ def task_rollout_test(out, data_npz, force=False,
     with torch.no_grad():
         pred_xy = p_theta(pred_flat.to(DEVICE)).cpu()
     pred_theta = torch.atan2(pred_xy[:, 1], pred_xy[:, 0]).reshape(n_rollout + 1, N_TEST)
-    true_theta = torch.stack([theta_tst[:, k * nf] for k in range(n_rollout + 1)], dim=0)
+    true_theta = torch.stack([theta_tst[:, k * nf_stride] for k in range(n_rollout + 1)], dim=0)
     dtheta = torch.atan2(torch.sin(pred_theta - true_theta),
                          torch.cos(pred_theta - true_theta))
     err_deg_sq    = torch.rad2deg(dtheta).pow(2)
@@ -389,6 +583,7 @@ def task_rollout_test(out, data_npz, force=False,
         vis_true_z       = vis_true_z.astype(np.float32),
         vis_pred_z       = vis_pred_z.astype(np.float32),
         num_frames       = np.array(nf),
+        nF_stride        = np.array(nf_stride),
         n_rollout        = np.array(n_rollout),
     )
     print(f"  → {out}  n_rollout={n_rollout}, N_TEST={N_TEST}")
@@ -401,7 +596,8 @@ def task_pca_kz8(out, data_npz, force=False, id_subsample=10_000, seed=1):
         return
     model, p = _load_checkpoint(CKPT_KZ8)
     frames = torch.from_numpy(data_npz["frames"]).float()
-    zx, numD = encode_dataset(model, frames, int(p["num_frames"]), device=DEVICE)
+    zx, numD = encode_dataset(model, frames, int(p["num_frames"]),
+                              nF_stride=int(p["nF_stride"]), device=DEVICE)
     zx_np = zx.numpy()
     z_centered = zx_np - zx_np.mean(axis=0)
     dz8 = zx_np.shape[1]
@@ -417,7 +613,7 @@ def task_pca_kz8(out, data_npz, force=False, id_subsample=10_000, seed=1):
     phys_dict = {k: data_npz[k] for k in ("theta", "vel_theta",
                                           "kinetic_energy", "potential_energy",
                                           "total_energy")}
-    fv, _ = _fvars_flat(phys_dict, int(p["num_frames"]))
+    fv, _ = _fvars_flat(phys_dict, int(p["num_frames"]), nF_stride=int(p["nF_stride"]))
     theta_deg = _wrap_deg(fv["theta"])
 
     # Intrinsic dimensionality
@@ -451,7 +647,7 @@ def task_pca_kz8(out, data_npz, force=False, id_subsample=10_000, seed=1):
         theta_deg     = theta_deg.astype(np.float32),
         var_exp       = var_exp.astype(np.float32),
         dz            = np.array(dz8, dtype=np.int32),
-        run_name      = np.array("kz8_nF2_N1000_rep21"),
+        run_name      = np.array(p["run_name"]),
     )
     print(f"  → {out}  PR={pr:.2f}, TwoNN={id_twonn:.2f}")
 
@@ -473,7 +669,9 @@ def task_cylindrical_phys(out, data_npz, force=False):
 
 # ─── orchestration ──────────────────────────────────────────────────────────
 TASKS = {
-    "sweep_metrics":     ("sweep_metrics.csv",     task_sweep_metrics,    False),
+    "sweep_metrics":        ("sweep_metrics.csv",           task_sweep_metrics,           False),
+    "sweep_metrics_mlp128x2": ("sweep_metrics_mlp128x2.csv", task_sweep_metrics_mlp128x2, False),
+    "prober_ablation":      ("prober_ablation.csv",         task_prober_ablation,        False),
     "phase_portrait":    ("phase_portrait.npz",    task_phase_portrait,   True),
     "embedding_kz2":     ("embedding_kz2.npz",     task_embedding_kz2,    True),
     "embedding_vs_N":    ("embedding_vs_N.npz",    task_embedding_vs_N,   True),
