@@ -57,7 +57,7 @@ FIGDATA_DIR = Path("figure_data")
 # Runs that have shipped checkpoints (figures that visualize embeddings).
 # All four are sourced from the "PRX" sweep (nF_stride=1) that produced the
 # final arxiv figures — see DETAILS.md "Provenance" section.
-CKPT_KZ2          = CKPT_DIR / "kz2_nF2_str1_N1000_rep3.pt"
+CKPT_KZ2          = CKPT_DIR / "my_run.pt"
 CKPT_KZ8          = CKPT_DIR / "kz8_nF2_str1_N1000_rep1.pt"
 CKPT_KZ2_N64      = CKPT_DIR / "kz2_nF2_str1_N64_rep3.pt"
 CKPT_KZ2_N256     = CKPT_DIR / "kz2_nF2_str1_N256_rep3.pt"
